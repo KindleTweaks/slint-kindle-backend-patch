@@ -81,7 +81,7 @@ impl TouchInput {
             )
         })?;
         let c_path = std::ffi::CString::new(path).unwrap();
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
