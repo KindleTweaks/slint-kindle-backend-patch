@@ -1,17 +1,19 @@
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use slint::Rgb8Pixel;
-use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
+use slint::platform::software_renderer::{
+    MinimalSoftwareWindow, RenderingRotation, RepaintBufferType,
+};
 use slint::platform::{EventLoopProxy, Platform, PlatformError, WindowAdapter};
 
 use crate::framebuffer::Framebuffer;
 use crate::power::{arm_wakealarm, find_wakealarm, suspend_to_mem};
-use crate::touch::TouchInput;
+use crate::touch::{TouchInput, has_accelerometer};
 use crate::wakeup::{self, KindleEventLoopProxy, Queue, Wakeup};
 use crate::{OnWakeCallback, WakeSchedule};
 
@@ -28,6 +30,7 @@ pub(crate) struct KindlePlatform {
     pub(crate) wake_schedule: Arc<Mutex<Option<WakeSchedule>>>,
     pub(crate) on_wake: OnWakeCallback,
     black_and_white: Arc<AtomicBool>,
+    rotation: Arc<AtomicU32>,
 }
 
 impl KindlePlatform {
@@ -35,6 +38,7 @@ impl KindlePlatform {
         wake_schedule: Arc<Mutex<Option<WakeSchedule>>>,
         on_wake: OnWakeCallback,
         black_and_white: Arc<AtomicBool>,
+        rotation: Arc<AtomicU32>,
     ) -> std::io::Result<Self> {
         let window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
         let wakeup = wakeup::make_wakeup()?;
@@ -47,6 +51,7 @@ impl KindlePlatform {
             wake_schedule,
             on_wake,
             black_and_white,
+            rotation,
         })
     }
 
@@ -125,11 +130,6 @@ impl Platform for KindlePlatform {
         let mut frame_buffer = Framebuffer::open()
             .map_err(|e| PlatformError::Other(format!("failed to open /dev/fb0: {e}")))?;
 
-        self.window.set_size(slint::PhysicalSize::new(
-            frame_buffer.width,
-            frame_buffer.height,
-        ));
-
         let mut touch_input = TouchInput::open(frame_buffer.width, frame_buffer.height)
             .map_err(|e| PlatformError::Other(format!("failed to open touch input: {e}")))?;
 
@@ -139,6 +139,20 @@ impl Platform for KindlePlatform {
         let width = frame_buffer.width as usize;
         let mut rgb_buffer = vec![Rgb8Pixel::default(); width * frame_buffer.height as usize];
         let mut gray_buffer = vec![0u8; width];
+
+        let render_offset = launch_render_offset();
+        let add_launch_offset = |app_rotation: u32| (app_rotation + render_offset) % 360;
+        // 90 or 270 rotated window is landscape mode
+        let (panel_width, panel_height) = (frame_buffer.width, frame_buffer.height);
+        let window_size = |app_rotation: u32| {
+            if add_launch_offset(app_rotation).is_multiple_of(180) {
+                slint::PhysicalSize::new(panel_width, panel_height)
+            } else {
+                slint::PhysicalSize::new(panel_height, panel_width)
+            }
+        };
+        let mut applied_rotation = self.rotation.load(Ordering::Relaxed);
+        self.window.set_size(window_size(applied_rotation));
 
         let wakeup_read_fd = self.wakeup.read.as_raw_fd();
 
@@ -234,19 +248,35 @@ impl Platform for KindlePlatform {
                 last_interaction = Instant::now();
             }
 
-            touch_input.poll(&self.window);
+            touch_input.poll(&self.window, applied_rotation);
             slint::platform::update_timers_and_animations();
 
             let black_and_white = self.black_and_white.load(Ordering::Relaxed);
+
+            let app_rotation = self.rotation.load(Ordering::Relaxed);
+            let rotation_changed = app_rotation != applied_rotation;
+            if rotation_changed {
+                applied_rotation = app_rotation;
+                self.window.set_size(window_size(app_rotation));
+                self.window.request_redraw();
+            }
             self.window.draw_if_needed(|renderer| {
+                renderer.set_rendering_rotation(match add_launch_offset(applied_rotation) {
+                    90 => RenderingRotation::Rotate90,
+                    180 => RenderingRotation::Rotate180,
+                    270 => RenderingRotation::Rotate270,
+                    _ => RenderingRotation::NoRotation,
+                });
+                if rotation_changed {
+                    renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
+                    renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
+                }
                 let dirty = renderer.render(&mut rgb_buffer, width);
                 let origin = dirty.bounding_box_origin();
                 let size = dirty.bounding_box_size();
                 let (x0, y0) = (origin.x as usize, origin.y as usize);
                 let (w, h) = (size.width as usize, size.height as usize);
 
-                // The E-ink screen only shows grayscale, so turn each RGB pixel into a single gray value.
-                // BT.601 luma weights (0.299, 0.587, 0.114) scaled by 256 and bitshifted to devide by 256.
                 let gray = &mut gray_buffer[..w];
                 for row in 0..h {
                     let start = (y0 + row) * width + x0;
@@ -263,7 +293,14 @@ impl Platform for KindlePlatform {
                     }
                     frame_buffer.write_line(y0 + row, x0..x0 + w, gray);
                 }
-                frame_buffer.refresh_region(origin, size);
+
+                // A rotation change rewrites every pixel so we refresh the whole panel
+                // so no ghost of the old orientation survives.
+                if rotation_changed {
+                    frame_buffer.refresh_full();
+                } else {
+                    frame_buffer.refresh_region(origin, size);
+                }
             });
         }
 
@@ -275,4 +312,17 @@ fn duration_to_ms(d: Duration) -> libc::c_int {
     // Round up to at least 1 ms. A timeout of 0 makes poll skip the wait
     // entirely, which would spin the CPU if a tiny timer kept re-firing.
     d.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int
+}
+
+/// Devices with an accelerometer let the framework flip its UI 180° when
+/// held the other way up. Touch input then already arrives flipped, but the
+/// framebuffer does not, so rendering has to compensate by whatever the
+/// framework thinks is up when the app starts. 
+fn launch_render_offset() -> u32 {
+    let flipped = has_accelerometer()
+        && std::process::Command::new("lipc-get-prop")
+            .args(["com.lab126.winmgr", "accelerometer"])
+            .output()
+            .is_ok_and(|out| out.status.success() && out.stdout.trim_ascii() == b"D");
+    if flipped { 180 } else { 0 }
 }

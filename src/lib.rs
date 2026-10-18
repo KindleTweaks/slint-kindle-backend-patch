@@ -29,7 +29,7 @@ use slint::platform::software_renderer::MinimalSoftwareWindow;
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -67,6 +67,7 @@ pub struct KindleBackend<State = NoSchedule> {
     wake_schedule: Arc<Mutex<Option<WakeSchedule>>>,
     on_wake: OnWakeCallback,
     black_and_white: Arc<AtomicBool>,
+    rotation: Arc<AtomicU32>,
     _state: PhantomData<State>,
 }
 
@@ -97,6 +98,15 @@ impl<State> KindleBackend<State> {
         self.black_and_white.store(enabled, Ordering::Relaxed);
     }
 
+    /// Rotate the UI by 0, 90, 180 or 270 degrees relative to the starting orientation.
+    pub fn set_rotation(&self, degrees: u32) {
+        assert!(
+            degrees.is_multiple_of(90),
+            "rotation must be a multiple of 90 degrees, got {degrees}"
+        );
+        self.rotation.store(degrees % 360, Ordering::Relaxed);
+    }
+
     /// Switch state, keeping the same internals.
     fn into_state<Next>(self) -> KindleBackend<Next> {
         KindleBackend {
@@ -104,6 +114,7 @@ impl<State> KindleBackend<State> {
             wake_schedule: self.wake_schedule,
             on_wake: self.on_wake,
             black_and_white: self.black_and_white,
+            rotation: self.rotation,
             _state: PhantomData,
         }
     }
@@ -184,10 +195,12 @@ pub fn install(font_data: &[u8]) -> Result<KindleBackend, slint::PlatformError> 
     let wake_schedule = Arc::new(Mutex::new(None));
     let on_wake: OnWakeCallback = Rc::new(RefCell::new(None));
     let black_and_white = Arc::new(AtomicBool::new(false));
+    let rotation = Arc::new(AtomicU32::new(0));
     let platform = KindlePlatform::new(
         wake_schedule.clone(),
         on_wake.clone(),
         black_and_white.clone(),
+        rotation.clone(),
     )
     .map_err(|e| slint::PlatformError::Other(format!("failed to init Kindle platform: {e}")))?;
     let window = platform.window.clone();
@@ -198,6 +211,7 @@ pub fn install(font_data: &[u8]) -> Result<KindleBackend, slint::PlatformError> 
         wake_schedule,
         on_wake,
         black_and_white,
+        rotation,
         _state: PhantomData,
     })
 }
