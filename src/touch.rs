@@ -234,7 +234,7 @@ impl TouchInput {
             return;
         }
         self.pressed = false;
-        let _ = window.dispatch_event_with_result(WindowEvent::PointerReleased {
+        let _ = window.dispatch_event(WindowEvent::PointerReleased {
             position: self.logical_position(),
             button: PointerEventButton::Left,
         });
@@ -261,7 +261,7 @@ impl TouchInput {
                 button: PointerEventButton::Left,
             }
         };
-        let _ = window.dispatch_event_with_result(pointer_event);
+        let _ = window.dispatch_event(pointer_event);
     }
 
     /// Only the app's rotation is undone, not the launch offset: when the

@@ -18,7 +18,7 @@ exclude = ["*.JPG", "*.jpg", "*.png", "*.webp", "examples"]
 members = ["examples/*"]
 
 [dependencies]
-slint = { version = "1.18", default-features = false, features = ["compat-1-2", "std", "renderer-software", "software-renderer-path"] }
+slint = { version = "=1.17.1", default-features = false, features = ["compat-1-2", "std", "renderer-software", "software-renderer-path"] }
 libc = "0.2"
 log = "0.4"
 # Pulled in transitively by slint (fontique via i-slint-common/parley, fontdb
