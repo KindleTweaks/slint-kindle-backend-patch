@@ -4206,15 +4206,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "slint-kindle-rotation"
-version = "0.1.0"
-dependencies = [
- "slint",
- "slint-backend-kindle",
- "slint-build",
-]
-
-[[package]]
 name = "slint-kindle-showcase"
 version = "0.1.0"
 dependencies = [

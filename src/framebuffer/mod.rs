@@ -38,8 +38,9 @@ impl UpdateVariant {
 
 /// Memory-mapped handle to the Kindle's e-ink framebuffer.
 ///
-/// Pixel format is 8-bit grayscale (one byte per pixel). The `stride` may be
-/// wider than `width` due to hardware alignment requirements.
+/// Pixel format is 8-bit grayscale (one byte per pixel) on most models, or
+/// 32 bpp on color models like the Colorsoft. The `stride` may be wider than
+/// `width * bytes_per_pixel` due to hardware alignment requirements.
 pub(crate) struct Framebuffer {
     file: std::fs::File,
     map: *mut u8,
@@ -47,6 +48,9 @@ pub(crate) struct Framebuffer {
     pub(crate) width: u32,
     pub(crate) height: u32,
     stride: usize,
+    /// Bytes per pixel in the mmap: 1 (8-bit grayscale, most Kindles) or
+    /// 4 (32-bit BGRA/RGBA, e.g. Kindle Colorsoft).
+    bytes_per_pixel: usize,
     /// The update ioctl variant this kernel accepts, cached after the first
     /// successful refresh. `None` until then.
     update_variant: Cell<Option<UpdateVariant>>,
@@ -96,23 +100,28 @@ impl Framebuffer {
         let height = vinfo.yres;
         let stride = finfo.line_length as usize;
 
-        // The whole render path treats the mmap as one byte per pixel. A
-        // different depth would silently produce garbled output, so reject it
-        // with a clear error instead.
-        if vinfo.bits_per_pixel != 8 {
+        // Most Kindles expose an 8-bit grayscale framebuffer, but color models
+        // (Kindle Colorsoft) expose a 32 bpp one. The render path produces one
+        // gray byte per pixel; for 32 bpp we replicate it into all three color
+        // channels, so the byte order (BGRA vs RGBA) doesn't matter.
+        let bytes_per_pixel = match vinfo.bits_per_pixel {
+            8 => 1,
+            32 => 4,
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unsupported framebuffer depth: {other} bpp (expected 8 or 32)"),
+                ));
+            }
+        };
+
+        if width == 0 || height == 0 || stride < width as usize * bytes_per_pixel {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported framebuffer depth: {} bpp (expected 8-bit grayscale)",
+                    "invalid framebuffer geometry: {width}x{height}, stride={stride}, bpp={}",
                     vinfo.bits_per_pixel
                 ),
-            ));
-        }
-
-        if width == 0 || height == 0 || stride < width as usize {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid framebuffer geometry: {width}x{height}, stride={stride}"),
             ));
         }
 
@@ -140,28 +149,48 @@ impl Framebuffer {
             width,
             height,
             stride,
+            bytes_per_pixel,
             update_variant: Cell::new(None),
         })
     }
 
     /// Write a horizontal span of grayscale pixels into the mmap at row `y`.
     pub(crate) fn write_line(&mut self, y: usize, x_range: Range<usize>, pixels: &[u8]) {
+        let bpp = self.bytes_per_pixel;
         let row_span = unsafe {
             std::slice::from_raw_parts_mut(
-                self.map.add(y * self.stride + x_range.start),
-                pixels.len(),
+                self.map.add(y * self.stride + x_range.start * bpp),
+                pixels.len() * bpp,
             )
         };
-        row_span.copy_from_slice(pixels);
+        match bpp {
+            1 => row_span.copy_from_slice(pixels),
+            _ => {
+                for (dst, &g) in row_span.chunks_exact_mut(4).zip(pixels) {
+                    dst.copy_from_slice(&[g, g, g, 0xff]);
+                }
+            }
+        }
     }
 
     /// Fill the entire visible area with a single grayscale value (0x00 = black, 0xff = white).
     pub(crate) fn fill(&mut self, value: u8) {
+        let bpp = self.bytes_per_pixel;
         for y in 0..self.height as usize {
             let row = unsafe {
-                std::slice::from_raw_parts_mut(self.map.add(y * self.stride), self.width as usize)
+                std::slice::from_raw_parts_mut(
+                    self.map.add(y * self.stride),
+                    self.width as usize * bpp,
+                )
             };
-            row.fill(value);
+            match bpp {
+                1 => row.fill(value),
+                _ => {
+                    for px in row.chunks_exact_mut(4) {
+                        px.copy_from_slice(&[value, value, value, 0xff]);
+                    }
+                }
+            }
         }
     }
 
