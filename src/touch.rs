@@ -15,6 +15,7 @@ struct TouchInputEvent {
 // Kernel-defined IDs we match against the `kind` and `code` fields of each event.
 const EVENT_SYNC: u16 = 0;
 const EVENT_ABSOLUTE_AXIS: u16 = 3;
+const EVENT_KEY: u16 = 1; //Amazon "snow protocol", BTN_TOUCH required instead of ABS_MT_TRACKING_ID for some KT4 panels.
 const SYNC_REPORT: u16 = 0;
 const SINGLE_TOUCH_POSITION_X: u16 = 0x00;
 const PRESSURE_AXIS: u16 = 0x18;
@@ -22,6 +23,7 @@ const TOUCH_SLOT: u16 = 0x2f;
 const TOUCH_POSITION_X: u16 = 0x35;
 const TOUCH_POSITION_Y: u16 = 0x36;
 const TOUCH_TRACKING_ID: u16 = 0x39;
+const BTN_TOUCH: u16 = 0x14a; 
 
 // The following constants/functions replicate Linux kernel C macros from <linux/input.h>
 // that aren't exposed by the `libc` crate. The formulas expand the _IOW/_IOR macro:
@@ -191,8 +193,11 @@ impl TouchInput {
                 (EVENT_ABSOLUTE_AXIS, TOUCH_POSITION_Y) if self.is_tracked_slot() => {
                     self.y = (event.value as f32) * self.screen_height / self.max_y;
                 }
-                (EVENT_ABSOLUTE_AXIS, TOUCH_TRACKING_ID) => {
-                    if event.value == -1 {
+                (EVENT_ABSOLUTE_AXIS, TOUCH_TRACKING_ID) | (EVENT_KEY, BTN_TOUCH) => {
+                    let is_lifted = (event.kind == EVENT_ABSOLUTE_AXIS && event.value == -1) 
+                    || (event.kind == EVENT_KEY && event.value == 0); //Kindle snow protocol - KT4 (https://github.com/koreader/koreader/blob/035e00b21d0286325ef2e8a7e3b6326f340e2ded/frontend/device/kindle/device.lua#L1764)
+
+                    if is_lifted { 
                         // The finger in the active slot lifted. Only end the
                         // stroke if it was the one we were following; a lifted
                         // secondary finger must not release the pointer.
